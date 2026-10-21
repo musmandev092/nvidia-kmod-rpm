@@ -199,6 +199,39 @@ jobs:
           path: repo/*.rpm
           retention-days: 7
 
+  e2e:
+    name: Real kernels up and down (release kernel -> newest stable)
+    needs: [plan, test]
+    if: ${{ !cancelled() && needs.test.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:40c267c70cdf6e232ed4dd16d7173bc7b1c30c4ba4a84518263b5bb3ee817367
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: repo
+          path: repo
+
+      - name: Add RPM Fusion
+        run: tools/setup-repos.sh
+
+      - name: Install, upgrade, hold back, remove and reinstall real kernels
+        run: |
+          q() { dnf -q repoquery --disablerepo='*' --enablerepo="$1" --arch=x86_64 --latest-limit=1 \
+                  --qf '%{version}-%{release}.%{arch}\n' kernel-core | grep .; }
+          old=$(q fedora); new=$(q updates || true)
+          if [ -z "$new" ] || [ "$new" = "$old" ]; then echo "No stable kernel update yet: nothing to move"; exit 0; fi
+          for k in "$old" "$new"; do
+            ls repo/kmod-nvidia-"$k"-*.rpm >/dev/null || { echo "::error::no kmod for $k"; exit 1; }
+          done
+          tests/test-e2e.sh repo "$old" "$new"
+
   security:
     name: Security checks
     needs: plan
@@ -233,10 +266,10 @@ jobs:
 
   publish:
     name: Sign and publish
-    needs: [plan, test, logic-tests, security]
+    needs: [plan, test, e2e, logic-tests, security]
     if: >-
       !cancelled() && needs.plan.outputs.publish == 'true' && needs.test.result == 'success' &&
-      needs.logic-tests.result == 'success' && needs.security.result == 'success'
+      needs.e2e.result == 'success' && needs.logic-tests.result == 'success' && needs.security.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write        # create the release

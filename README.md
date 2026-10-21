@@ -30,8 +30,12 @@ Updates: `sudo dnf upgrade`. That's all.
 | Event | What you get |
 |---|---|
 | Fedora ships a new kernel | CI built its module from `updates-testing` days earlier, so `dnf upgrade` installs kernel + module together |
-| New kernel but no module yet (CI broken, unusual kernel) | The kernel installs; `nvidia-kmod-guard` keeps the previous kernel as the boot default and switches over once the module arrives |
+| New kernel but no module yet | `dnf upgrade` **holds the kernel back** ("Skipping packages with conflicts") and upgrades everything else; the next upgrade after CI publishes the module installs both |
 | RPM Fusion ships a new NVIDIA version | `dnf upgrade` holds the NVIDIA packages back until modules for it are published, then upgrades driver and modules together |
+| A kernel without module gets installed anyway (other repo, `rpm -i`) | `nvidia-kmod-guard` keeps the previous kernel as the GRUB default and switches over once the module arrives |
+
+So the order is always: **module ready first, then the kernel or driver update.** No manual step,
+no special command: plain `dnf upgrade` does it.
 
 Check anytime: `nvidia-kmod-guard status`.
 
@@ -40,7 +44,7 @@ Check anytime: `nvidia-kmod-guard status`.
 | Package | Contents |
 |---|---|
 | `kmod-nvidia-<kernel>` | The compiled modules, one package per kernel. Requires only `kernel-uname-r = <kernel>` and `nvidia-kmod-common >= <version>` |
-| `nvidia-kmod-control` | Rules `(kmod-nvidia-K if kernel-core-uname-r = K)` for every built kernel; replaces `akmod-nvidia`; hides RPM Fusion's akmod via `/usr/share/dnf5/repos.override.d/80-nvidia-kmod-rpm.repo` |
+| `nvidia-kmod-control` | Rules `(kmod-nvidia-K if kernel-core-uname-r = K)` for every built kernel; `Conflicts: kernel-core > <newest built kernel>`; replaces `akmod-nvidia`; hides RPM Fusion's akmod via `/usr/share/dnf5/repos.override.d/80-nvidia-kmod-rpm.repo` |
 | `nvidia-kmod-guard` | `kernel-install` plugin + RPM file trigger that keep a kernel with a matching module as the GRUB default |
 
 Keep at least 3 kernels so a fallback always exists: Fedora's default `installonly_limit` is 3. If

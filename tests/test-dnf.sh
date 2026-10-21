@@ -35,10 +35,15 @@ stub() {
     rpmbuild -bb --quiet --define "_topdir $w/build" --define "_rpmdir $w/$repo" \
         --define '_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm' "$w/build/$name.spec"
 }
-kernel() {  # kernel <uname-r>
+kernel() {  # kernel <uname-r>: kernel, kernel-modules, kernel-core like Fedora's
     local v=${1%%-*} r=${1#*-}
-    stub updates kernel-core 0 "$v" "${r%.x86_64}" \
+    r=${r%.x86_64}
+    stub updates kernel-core 0 "$v" "$r" \
         "Provides: kernel-uname-r = $1" "Provides: kernel-core-uname-r = $1" "Provides: installonlypkg(kernel)"
+    stub updates kernel-modules 0 "$v" "$r" "Provides: kernel-modules-uname-r = $1" \
+        "Requires: kernel-core-uname-r = $1" "Provides: installonlypkg(kernel-module)"
+    stub updates kernel 0 "$v" "$r" "Requires: kernel-core-uname-r = $1" \
+        "Requires: kernel-modules-uname-r = $1" "Provides: installonlypkg(kernel)"
 }
 userspace() {  # userspace <version>: RPM Fusion's xorg-x11-drv-nvidia + akmod
     stub rpmfusion xorg-x11-drv-nvidia 3 "$1" 1.fc44 \
@@ -89,7 +94,7 @@ evr() { rpm -q --qf '%{VERSION}\n' "$1"; }
 
 echo "== Laptop today: kernel K1, NVIDIA $V1 with RPM Fusion's akmod"
 kernel "$K1"; userspace "$V1"; publish
-D install kernel-core xorg-x11-drv-nvidia akmod-nvidia
+D install kernel xorg-x11-drv-nvidia akmod-nvidia
 check "akmod installed (starting point)" installed akmod-nvidia
 
 echo "== Switch: dnf install nvidia-kmod-control"
@@ -105,7 +110,7 @@ check "asking for the akmod still doesn't install it" bash -c "! rpm -q akmod-nv
 echo "== Fedora ships kernel K2; CI already built its module"
 kernel "$K2"; kmod "$K2" "$V1"; control 2 "$w/ours" "$K1" "$K2"; publish
 D upgrade
-check "kernel K2 installed" bash -c "rpm -q kernel-core | grep -q 9.2.0"
+check "kernel K2 installed" bash -c "rpm -q kernel | grep -q 9.2.0"
 check "kmod for K2 came in the same upgrade" installed "kmod-nvidia-$K2"
 
 echo "== RPM Fusion ships NVIDIA $V2 before CI built modules for it"
@@ -120,19 +125,21 @@ check "userspace now $V2" test "$(evr xorg-x11-drv-nvidia)" = "$V2"
 check "kmod K1 upgraded to $V2" test "$(evr "kmod-nvidia-$K1")" = "$V2"
 check "kmod K2 upgraded to $V2" test "$(evr "kmod-nvidia-$K2")" = "$V2"
 
-echo "== Fedora ships kernel K3 that CI never saw (no module)"
+echo "== Fedora ships kernel K3 before CI built its module"
 kernel "$K3"; publish
 D upgrade
-check "kernel K3 still installs" bash -c "rpm -q kernel-core | grep -q 9.3.0"
-check "no kmod for K3 (guard keeps old kernel as default)" bash -c "! rpm -q kmod-nvidia-$K3 >/dev/null"
+check "kernel K3 held back (no module yet), rest of the system upgraded" \
+    bash -c "! rpm -q kernel-core kernel kernel-modules | grep -q 9.3.0"
+check "asking for K3 explicitly is refused with a conflict" bash -c "! dnf -y -q install kernel-9.3.0 >/dev/null 2>&1"
 
 echo "== CI catches up with K3"
 kmod "$K3" "$V2"; control 3 "$w/ours" "$K1" "$K2" "$K3"; publish
 D upgrade
-check "kmod for K3 installed" installed "kmod-nvidia-$K3"
+check "kernel K3 installed" bash -c "rpm -q kernel | grep -q 9.3.0"
+check "and its kmod in the same upgrade" installed "kmod-nvidia-$K3"
 
 echo "== Old kernel K1 is removed"
-D remove "kernel-core-${K1%.x86_64}"
+D remove "kernel-${K1%.x86_64}" "kernel-modules-${K1%.x86_64}" "kernel-core-${K1%.x86_64}"
 check "its kmod went with it" bash -c "! rpm -q kmod-nvidia-$K1 >/dev/null"
 D upgrade
 check "upgrade still works afterwards" true

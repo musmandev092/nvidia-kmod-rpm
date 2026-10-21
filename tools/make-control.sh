@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 # Build the nvidia-kmod-control RPM: the one package users install.
 #  - Requires the guard and the NVIDIA userspace from RPM Fusion.
+#  - Holds back kernels newer than the newest one we have a module for.
 #  - One rich dependency per kernel we have a module for:
 #      (kmod-nvidia-K if kernel-core-uname-r = K)
 #    so the kernel and its module arrive in the same dnf transaction.
@@ -30,6 +31,10 @@ requires=""
 for k in "$@"; do
     requires+="Requires:       (kmod-nvidia-$k if kernel-core-uname-r = $k)"$'\n'
 done
+# Kernel gate: dnf (best=0) holds back any kernel newer than the newest one
+# we have a module for, until CI publishes that module.
+newest=$(printf '%s\n' "$@" | sort -V | tail -n1)
+requires+="Conflicts:      kernel-core > ${newest%.x86_64}"$'\n'
 
 cat > "$top/SPECS/nvidia-kmod-control.spec" <<EOF
 Name:           nvidia-kmod-control
