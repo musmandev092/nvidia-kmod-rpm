@@ -1,0 +1,369 @@
+name: Build
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RPM_KEY_FPR: "975BA05E7774D44BDCCBBB12E5C06F1D19898021"  # public key fingerprint, gitleaks:allow
+
+jobs:
+  plan:
+    name: What to build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:40c267c70cdf6e232ed4dd16d7173bc7b1c30c4ba4a84518263b5bb3ee817367
+    outputs:
+      builds: ${{ steps.plan.outputs.builds }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Tools
+        run: dnf -y -q install jq git-core
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Add RPM Fusion (release RPMs checked against pinned keys)
+        run: tools/setup-repos.sh
+
+      - name: Compare Fedora kernels and RPM Fusion NVIDIA versions with what is published
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          pages="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          fetch() { curl -sS --max-time 60 -o "$2" -w '%{http_code}' "$pages/$1" || true; }
+          kmods=$(fetch kmods.json published.json)
+          info=$(fetch BUILDINFO.json buildinfo.json)
+          if [ "$kmods" = 404 ] && [ "$info" = 404 ]; then
+            echo "Nothing published yet"
+            echo '[]' > published.json; echo '{}' > buildinfo.json
+          elif [ "$kmods" != 200 ] || [ "$info" != 200 ]; then
+            echo "::error::Could not read the published repo (kmods.json: $kmods, BUILDINFO.json: $info)"
+            exit 1
+          fi
+
+          tools/plan.sh published.json > plan.json
+          if [ "$EVENT" = pull_request ] && [ "$(jq '.builds | length' plan.json)" = 0 ]; then
+            # Always prove the build works on a PR: newest kernel, stable NVIDIA.
+            jq '.kernels[-1] as $k | .nvidia_stable as $n
+                | .builds = [{kver: $k, nvidia: $n}]
+                | .keep |= map(select(.kver != $k or .nvidia != $n))' plan.json > p && mv p plan.json
+          fi
+          cat plan.json
+
+          changed=false
+          [ "$(jq '.builds | length' plan.json)" != 0 ] && changed=true
+          [ "$(jq -c '.kernels' plan.json)" != "$(jq -c '.kernels // []' buildinfo.json)" ] && changed=true
+          [ "$(jq -c '.nvidia' plan.json)" != "$(jq -c '.nvidia // []' buildinfo.json)" ] && changed=true
+          pub_commit=$(jq -r '.source_commit // ""' buildinfo.json)
+          if [ -z "$pub_commit" ] || ! git cat-file -e "$pub_commit^{commit}" 2>/dev/null ||
+             ! git diff --quiet "$pub_commit" HEAD -- packaging tools site keys; then
+            changed=true
+          fi
+          [ "$EVENT" = workflow_dispatch ] && changed=true
+          publish=false
+          if [ "$changed" = true ] && [ "$EVENT" != pull_request ] && [ "$REF" = refs/heads/main ]; then
+            publish=true
+          fi
+          { echo "builds=$(jq -c .builds plan.json)"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+          echo "changed=$changed publish=$publish"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: plan
+          path: |
+            plan.json
+            published.json
+          retention-days: 7
+
+  build:
+    name: kmod ${{ matrix.kver }} / NVIDIA ${{ matrix.nvidia }}
+    needs: plan
+    if: needs.plan.outputs.builds != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:40c267c70cdf6e232ed4dd16d7173bc7b1c30c4ba4a84518263b5bb3ee817367
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Add RPM Fusion
+        run: tools/setup-repos.sh
+
+      - name: Build from RPM Fusion's akmod source
+        env:
+          KVER: ${{ matrix.kver }}
+          NVIDIA: ${{ matrix.nvidia }}
+        run: tools/ci-build.sh "$KVER" "$NVIDIA" out
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: kmod-${{ strategy.job-index }}
+          path: out/*.rpm
+          retention-days: 7
+
+  logic-tests:
+    name: Update scenarios and boot guard
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:40c267c70cdf6e232ed4dd16d7173bc7b1c30c4ba4a84518263b5bb3ee817367
+    steps:
+      - name: Tools
+        run: dnf -y -q install --setopt=install_weak_deps=False rpm-build createrepo_c grubby kmod systemd-udev
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Boot guard
+        run: tests/test-guard.sh
+
+      - name: dnf install / upgrade scenarios
+        run: tests/test-dnf.sh
+
+  test:
+    name: Install test (real Fedora + RPM Fusion)
+    needs: [plan, build]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (needs.plan.outputs.publish == 'true' || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:40c267c70cdf6e232ed4dd16d7173bc7b1c30c4ba4a84518263b5bb3ee817367
+    steps:
+      - name: Tools
+        run: dnf -y -q install --setopt=install_weak_deps=False jq rpm-build createrepo_c kmod
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: plan
+
+      - name: Kmods built in this run (failed builds simply have none)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: kmod-*
+          path: new
+          merge-multiple: true
+
+      - name: Add RPM Fusion
+        run: tools/setup-repos.sh
+
+      - name: Assemble the repo (kept + new kmods, guard, control)
+        run: |
+          mkdir -p new
+          pages="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          tools/assemble.sh plan.json new repo "$pages"
+          ls -l repo
+
+      - name: Install and check
+        run: |
+          cp -r repo /tmp/testrepo
+          tests/test-real.sh /tmp/testrepo
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: repo
+          path: repo/*.rpm
+          retention-days: 7
+
+  security:
+    name: Security checks
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: No secrets anywhere in the git history (gitleaks)
+        uses: docker://docker.io/zricethezav/gitleaks@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: "*"
+        with:
+          args: git . --no-banner --redact --exit-code 1
+
+      - name: Workflow security (zizmor, strictest persona)
+        run: pipx run zizmor==1.30.1 --offline --persona=auditor --format=plain .github/workflows/
+
+      - name: Workflow correctness (actionlint)
+        uses: docker://docker.io/rhysd/actionlint@sha256:9d36088643581e728c969f35141f88139fec77280b2be23c1f66f8e40e1025e7
+        with:
+          args: -no-color
+
+      - name: Shell scripts (shellcheck)
+        run: shellcheck -S warning tools/*.sh tests/*.sh packaging/nvidia-kmod-guard packaging/99-nvidia-kmod-guard.install
+
+  publish:
+    name: Sign and publish
+    needs: [plan, test, logic-tests, security]
+    if: >-
+      !cancelled() && needs.plan.outputs.publish == 'true' && needs.test.result == 'success' &&
+      needs.logic-tests.result == 'success' && needs.security.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the release
+      pages: write           # deploy the dnf repository
+      id-token: write        # Pages deployment + build provenance
+      attestations: write    # build provenance anyone can verify
+    environment:
+      name: github-pages
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:40c267c70cdf6e232ed4dd16d7173bc7b1c30c4ba4a84518263b5bb3ee817367
+    steps:
+      - name: Tools
+        run: dnf -y -q install rpm-sign createrepo_c gnupg2 git-core gh jq
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: plan
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: repo
+          path: repo
+
+      - name: Sign the RPMs and the repository
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.RPM_GPG_KEY_ID }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ] || [ -z "$GPG_KEY_ID" ]; then
+            echo "::error::The RPM_GPG_PRIVATE_KEY / RPM_GPG_KEY_ID secrets are not set"
+            exit 1
+          fi
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          rpm --define "_gpg_name $GPG_KEY_ID" --define "_openpgp_sign_id $GPG_KEY_ID" --addsign repo/*.rpm
+          dir="_site/repo/fedora-$(rpm -E %fedora)/x86_64"
+          mkdir -p "$dir"
+          cp repo/*.rpm "$dir/"
+          createrepo_c --general-compress-type=xz "$dir"
+          gpg --batch --yes --local-user "$GPG_KEY_ID" --detach-sign --armor "$dir/repodata/repomd.xml"
+
+      - name: Check signatures with the published public key
+        run: |
+          dir="_site/repo/fedora-$(rpm -E %fedora)/x86_64"
+          db=$(mktemp -d)
+          rpmkeys --dbpath "$db" --import keys/RPM-GPG-KEY-nvidia-kmod-rpm.asc
+          for f in "$dir"/*.rpm; do
+            rpmkeys --dbpath "$db" --checksig "$f" | grep -q ': digests signatures OK$' || { echo "::error::$f is not signed"; exit 1; }
+          done
+          gh=$(mktemp -d)
+          gpg --homedir "$gh" --batch --import keys/RPM-GPG-KEY-nvidia-kmod-rpm.asc
+          gpg --homedir "$gh" --batch --status-fd 1 --verify "$dir/repodata/repomd.xml.asc" "$dir/repodata/repomd.xml" \
+            | grep -q "VALIDSIG $RPM_KEY_FPR " || { echo "::error::repomd.xml is not signed by $RPM_KEY_FPR"; exit 1; }
+
+      - name: Build Pages content (repo file, key, build record)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          pages="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          dir="_site/repo/fedora-$(rpm -E %fedora)/x86_64"
+          sed "s|@URL@|$pages|g" site/nvidia-kmod-rpm.repo > _site/nvidia-kmod-rpm.repo
+          cp site/index.html _site/
+          cp keys/RPM-GPG-KEY-nvidia-kmod-rpm.asc _site/
+          touch _site/.nojekyll
+          for f in "$dir"/kmod-nvidia-*.rpm; do
+            rpm -qp --qf '%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\n' "$f" | {
+              read -r name evr
+              jq -n --arg k "${name#kmod-nvidia-}" --arg n "$evr" --arg f "${f##*/}" \
+                    --arg s "$(sha256sum "$f" | cut -d' ' -f1)" '{kver: $k, nvidia: $n, file: $f, sha256: $s}'
+            }
+          done | jq -s 'sort_by(.kver, .nvidia)' > _site/kmods.json
+          (cd "$dir" && sha256sum ./*.rpm) | jq -R 'split("  ./") | {file: .[1], sha256: .[0]}' | jq -s . > packages.json
+          jq -n --slurpfile plan plan.json --slurpfile pkgs packages.json \
+                --arg head "$(git rev-parse HEAD)" \
+                --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                --arg ev "$GITHUB_EVENT_NAME" --arg fpr "$RPM_KEY_FPR" \
+             '{kernels: $plan[0].kernels, nvidia: $plan[0].nvidia, nvidia_stable: $plan[0].nvidia_stable,
+               packages: $pkgs[0], source_commit: $head, built_by: $run, trigger: $ev,
+               source: "RPM Fusion akmod-nvidia SRPM, unmodified, open kernel module",
+               signing_key_fingerprint: $fpr, human_involved: false}' > _site/BUILDINFO.json
+          cat _site/BUILDINFO.json _site/kmods.json
+          if grep -l '@[A-Z_]*@' _site/nvidia-kmod-rpm.repo _site/index.html; then exit 1; fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: |
+            _site/BUILDINFO.json
+            _site/repo/*/x86_64/*.rpm
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+
+      - name: Create GitHub Release (new packages of this run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          dir="_site/repo/fedora-$(rpm -E %fedora)/x86_64"
+          tag="r$(date -u +%Y%m%d-%H%M)"
+          files=("$dir"/nvidia-kmod-control-*.rpm "$dir"/nvidia-kmod-guard-*.rpm _site/BUILDINFO.json)
+          for f in "$dir"/kmod-nvidia-*.rpm; do
+            jq -e --arg f "${f##*/}" '[.keep[].file] | index($f)' plan.json >/dev/null || files+=("$f")
+          done
+          pages="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          {
+            echo "Prebuilt NVIDIA kernel modules for Fedora $(rpm -E %fedora)."
+            echo "Built from RPM Fusion's unmodified akmod-nvidia source, install-tested, signed and published by"
+            echo "[this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID), with no human step."
+            echo
+            echo '```sh'
+            echo "sudo dnf config-manager addrepo --from-repofile=$pages/nvidia-kmod-rpm.repo"
+            echo "sudo dnf install nvidia-kmod-control"
+            echo '```'
+            echo '```json'
+            cat _site/BUILDINFO.json
+            echo '```'
+            echo "Verify: \`gh attestation verify BUILDINFO.json -R $GITHUB_REPOSITORY\`"
+          } > notes.md
+          gh release create "$tag" "${files[@]}" --title "$tag" --notes-file notes.md

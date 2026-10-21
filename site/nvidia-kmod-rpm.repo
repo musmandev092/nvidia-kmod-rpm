@@ -1,0 +1,9 @@
+[nvidia-kmod-rpm]
+name=Prebuilt NVIDIA kernel modules for Fedora $releasever (unofficial)
+baseurl=@URL@/repo/fedora-$releasever/$basearch
+enabled=1
+type=rpm
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=@URL@/RPM-GPG-KEY-nvidia-kmod-rpm.asc
+metadata_expire=3h

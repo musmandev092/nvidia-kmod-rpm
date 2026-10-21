@@ -1,0 +1,12 @@
+#!/usr/bin/bash
+# kernel-install plugin. "99-" runs after 20-grub.install and
+# 95-set-boot-entry.install have made the new kernel the boot default, so the
+# guard can move the default back if the NVIDIA module is missing.
+# It must never make a kernel installation fail.
+
+COMMAND="$1"
+
+if [[ $COMMAND == add ]]; then
+    /usr/bin/nvidia-kmod-guard sync || :
+fi
+exit 0
