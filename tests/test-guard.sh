@@ -64,7 +64,17 @@ expect "$K3" "no kernel matches the userspace: nothing is changed"
 NVIDIA_KMOD_GUARD_USERSPACE='' sync
 expect "$K3" "no NVIDIA driver installed: nothing is changed"
 
+K4=7.3.2-200.fc44.x86_64
+kernel "$K4"
+printf '#!/usr/bin/bash\n[[ $1 == --default-kernel ]] && cat "%s/default"\nexit 0\n' "$t" > "$t/grubby-broken"
+chmod +x "$t/grubby-broken"
+NVIDIA_KMOD_GUARD_GRUBBY=$t/grubby-broken "$guard" sync 2>/dev/null && { echo "FAIL - sync should fail when grubby can't switch"; exit 1; }
+[[ ! -f $t/state/held ]] || { echo "FAIL - held marker written although the default did not change"; exit 1; }
+echo "ok   - grubby not switching the default is reported, nothing recorded"
+kmod "$K4" 615.78.08; sync
+expect "$K4" "module for $K4 installed: it stays default"
+
 status=$("$guard" status)
-grep -Eq "^\* $K3 +ok$" <<<"$status" || { echo "FAIL - status output"; echo "$status"; exit 1; }
+grep -Eq "^\* $K4 +ok$" <<<"$status" || { echo "FAIL - status output"; echo "$status"; exit 1; }
 echo "ok   - status marks the default kernel"
 echo "All guard tests passed"

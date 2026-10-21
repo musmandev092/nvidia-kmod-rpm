@@ -1,5 +1,5 @@
 Name:           nvidia-kmod-guard
-Version:        1.0
+Version:        1.1
 Release:        1%{?dist}
 Summary:        Keep booting a kernel that has its NVIDIA module
 License:        MIT
@@ -37,5 +37,8 @@ install -dm0755 %{buildroot}%{_sharedstatedir}/nvidia-kmod-guard
 %dir %{_sharedstatedir}/nvidia-kmod-guard
 
 %changelog
+* Wed Oct 21 2026 musmandev092 <mosman092@hotmail.com> - 1.1-1
+- Check that grubby really changed the boot default before recording it
+
 * Wed Oct 21 2026 musmandev092 <mosman092@hotmail.com> - 1.0-1
 - First version

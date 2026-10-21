@@ -47,8 +47,9 @@ default_kernel() {
     echo "${k##*/vmlinuz-}"
 }
 
-set_default() {
-    "$GRUBBY" --set-default "$BOOT/vmlinuz-$1" >/dev/null
+set_default() {  # returns non-zero if the boot default did not change
+    "$GRUBBY" --set-default "$BOOT/vmlinuz-$1" >/dev/null || return 1
+    [[ $(default_kernel) == "$1" ]]
 }
 
 cmd_status() {
@@ -84,14 +85,17 @@ cmd_sync() {
             return 0
         fi
         if [[ $def == "$newest" ]]; then
-            set_default "$best"
+            if ! set_default "$best"; then
+                log "ERROR: could not make $best the boot default; kernel $newest has no NVIDIA $want module"
+                return 1
+            fi
             mkdir -p "$STATE"
             echo "$newest" > "$STATE/held"
             log "kernel $newest has no NVIDIA $want module yet; booting $best until it arrives"
         fi
     elif [[ -f $STATE/held ]]; then
         if [[ $def != "$newest" ]]; then
-            set_default "$newest"
+            set_default "$newest" || { log "ERROR: could not make $newest the boot default"; return 1; }
             log "NVIDIA module for $newest is installed; it is the boot default again"
         fi
         rm -f "$STATE/held"

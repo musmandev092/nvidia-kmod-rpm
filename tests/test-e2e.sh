@@ -62,6 +62,8 @@ if [[ ! -e /usr/bin/grub2-editenv.real ]]; then
         '[[ $f == - || $f == /boot/grub2/grubenv ]] && f=/var/lib/test-grub/grubenv' \
         'exec /usr/bin/grub2-editenv.real "$f" "$@"' > /usr/bin/grub2-editenv
     chmod +x /usr/bin/grub2-editenv
+    # grubby --default-kernel greps this path directly, so it must show the same file.
+    ln -sfn /var/lib/test-grub/grubenv /boot/grub2/grubenv
 fi
 grub2-editenv - list >/dev/null || fail "grubenv not usable"
 ok "fake /boot ready"
