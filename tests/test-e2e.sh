@@ -55,7 +55,8 @@ ok "fake /boot ready"
 
 step "Our repo: signed with a throwaway key, served over HTTP"
 export GNUPGHOME=/root/.gnupg-test
-mkdir -p -m 700 "$GNUPGHOME" "$repo"
+mkdir -p "$repo"
+mkdir -m 700 "$GNUPGHOME"
 gpg --batch --quiet --passphrase '' --quick-gen-key "e2e test key" ed25519 sign 1d 2>/dev/null
 fpr=$(gpg --list-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
 gpg --armor --export "$fpr" > "$srv/key.asc"
