@@ -50,7 +50,20 @@ GRUB_CMDLINE_LINUX="rhgb quiet"
 EOF
 echo "root=UUID=00000000-0000-0000-0000-000000000000 ro rhgb quiet" > /etc/kernel/cmdline
 mkdir -p /boot/loader/entries /boot/grub2
-[[ -f /boot/grub2/grubenv ]] || grub2-editenv /boot/grub2/grubenv create
+# grub2-editenv probes the disk behind the default env file (/boot/grub2/grubenv)
+# and a container has none. Shim: the same binary, given an explicit file
+# (which it does not probe). Fedora's kernel-install plugins, grubby, the BLS
+# entries and our guard all run unchanged.
+if [[ ! -e /usr/bin/grub2-editenv.real ]]; then
+    mkdir -p /var/lib/test-grub
+    { printf '# GRUB Environment Block\n'; head -c 999 /dev/zero | tr '\0' '#'; } > /var/lib/test-grub/grubenv
+    mv /usr/bin/grub2-editenv /usr/bin/grub2-editenv.real
+    printf '%s\n' '#!/usr/bin/bash' 'f=$1; shift' \
+        '[[ $f == - || $f == /boot/grub2/grubenv ]] && f=/var/lib/test-grub/grubenv' \
+        'exec /usr/bin/grub2-editenv.real "$f" "$@"' > /usr/bin/grub2-editenv
+    chmod +x /usr/bin/grub2-editenv
+fi
+grub2-editenv - list >/dev/null || fail "grubenv not usable"
 ok "fake /boot ready"
 
 step "Our repo: signed with a throwaway key, served over HTTP"
